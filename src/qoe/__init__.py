@@ -5,6 +5,25 @@ import sys
 import os
 from mavsdk import System
 
+# ======== 建立暫存遙測數據的字典 ========
+telemetry_data = {
+    "alt_rel": 0.0,
+    "battery_pct": 0.0,
+    "voltage": 0.0
+}
+
+# 任務 1：持續監聽高度資料
+async def update_position(drone):
+    async for position in drone.telemetry.position():
+        telemetry_data["alt_rel"] = position.relative_altitude_m
+
+# 任務 2：持續監聽電池資料
+async def update_battery(drone):
+    async for battery in drone.telemetry.battery():
+        telemetry_data["battery_pct"] = battery.remaining_percent * 100
+        telemetry_data["voltage"] = battery.voltage_v
+# ========================================
+
 async def run(plan_file):
     # 檢查檔案是否存在
     if not os.path.exists(plan_file):
@@ -12,7 +31,7 @@ async def run(plan_file):
         sys.exit(1)
 
     drone = System()
-    
+
     print("正在等待無人機連線...")
     await drone.connect(system_address="serial:///dev/ttyAMA0:57600")
 
@@ -21,9 +40,17 @@ async def run(plan_file):
             print("✅ 無人機連線成功！")
             break
 
+    # 在連線後立即啟動背景監聽任務
+    asyncio.create_task(update_position(drone))
+    asyncio.create_task(update_battery(drone))
+    
+    # 稍微等待資料流進來，並顯示起飛前電量
+    await asyncio.sleep(1)
+    print(f"🔋 起飛前電量確認: {telemetry_data['battery_pct']:.0f}% ({telemetry_data['voltage']:.2f}V)\n")
+
     # 1. 讀取並解析從參數傳入的任務檔案
     print(f"正在讀取任務檔案: {plan_file} ...")
-    
+
     try:
         mission_import_data = await drone.mission_raw.import_qgroundcontrol_mission(plan_file)
         mission_items = mission_import_data.mission_items
@@ -38,7 +65,7 @@ async def run(plan_file):
             elif item.command == 16: # 如果沒起飛點，找第一個一般航點 MAV_CMD_NAV_WAYPOINT
                 target_takeoff_alt = item.z
                 break
-                
+
         print(f"🔍 根據任務設定，將自動起飛高度設為: {target_takeoff_alt} 公尺")
         # ==================================
 
@@ -75,11 +102,11 @@ async def run(plan_file):
     try:
         await drone.action.set_takeoff_altitude(target_takeoff_alt)
         await drone.action.takeoff()
-        
+
         # 依高度預留爬升時間 (每公尺約給予 3 秒寬限)
         sleep_time = max(5, int(target_takeoff_alt * 3))
         print(f"等待無人機升空 ({sleep_time} 秒)...")
-        await asyncio.sleep(sleep_time) 
+        await asyncio.sleep(sleep_time)
 
         print("👉 切換為自動任務模式以執行後續航點 (Start Mission)！")
         await drone.mission_raw.start_mission()
@@ -91,21 +118,32 @@ async def run(plan_file):
         print(f"✅ 目前飛控模式: {mode}")
         break
 
-    # 6. 持續監控
+    # 6. 持續監控 (改用主迴圈讀取暫存字典)
     print("持續監控無人機狀態 (按 Ctrl+C 中止監控)...")
-    async for position in drone.telemetry.position():
-        print(f"目前相對高度: {position.relative_altitude_m:.2f} 公尺", end="\r")
+    print("-" * 50)
+    try:
+        while True:
+            await asyncio.sleep(0.5)
+            # 動態顯示高度與電量，並利用空白蓋掉舊字元
+            print(f"高度: {telemetry_data['alt_rel']:>5.2f}m | "
+                  f"電量: {telemetry_data['battery_pct']:>3.0f}% "
+                  f"({telemetry_data['voltage']:.2f}V)   ", end="\r")
+    except asyncio.CancelledError:
+        pass
 
 
 def main():
     # 使用 argparse 處理命令列參數
     parser = argparse.ArgumentParser(description="上傳並執行 QGC 任務檔案")
     parser.add_argument(
-        "plan_file", 
+        "plan_file",
         help="QGC 任務檔案 (.plan) 的路徑"
     )
     args = parser.parse_args()
 
     # 將參數傳遞給非同步主函數
-    asyncio.run(run(args.plan_file))
+    try:
+        asyncio.run(run(args.plan_file))
+    except KeyboardInterrupt:
+        print("\n\n⏹️ 任務監控已結束。")
 
